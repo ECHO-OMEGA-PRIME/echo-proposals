@@ -1,0 +1,30 @@
+name = "echo-proposals"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-proposals"
+database_id = "c34b0a5b-a261-423d-a0a1-106fb2a8d124"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "44d5e2629934427bb7e29718dda3d8bd"
+
+[triggers]
+crons = ["0 6 * * *"]
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[services]]
+binding = "EMAIL_SENDER"
+service = "echo-email-sender"
