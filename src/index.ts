@@ -30,9 +30,12 @@ function slug(): string {
   for (const b of a) s += c[b % c.length]; return s;
 }
 
-function cors(res: Response): Response {
+const ALLOWED_ORIGINS = ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://profinishusa.com','https://bgat.echo-op.com'];
+function cors(res: Response, reqOrigin?: string | null): Response {
   const h = new Headers(res.headers);
-  h.set('Access-Control-Allow-Origin', '*');
+  const origin = reqOrigin && ALLOWED_ORIGINS.includes(reqOrigin) ? reqOrigin : ALLOWED_ORIGINS[0];
+  h.set('Access-Control-Allow-Origin', origin);
+  h.set('Vary', 'Origin');
   h.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   h.set('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Echo-API-Key,X-Tenant-ID');
   return new Response(res.body, { status: res.status, headers: h });
