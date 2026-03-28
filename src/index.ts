@@ -101,7 +101,7 @@ function calcTotal(items: any[], discountType?: string, discountValue?: number, 
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (req.method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
     const url = new URL(req.url);
     const p = url.pathname;
@@ -222,8 +222,8 @@ var startTime=Date.now();window.addEventListener('beforeunload',function(){var d
         await env.DB.prepare("UPDATE proposals SET status = 'accepted', accepted_at = datetime(?), accepted_by = ?, accepted_ip = ?, signature_data = ? WHERE id = ?")
           .bind('now', sanitize(body.name || 'Client', 100), ip, body.signature || null, proposal.id).run();
         await env.DB.prepare('INSERT INTO activity_log (tenant_id, proposal_id, action, details, actor) VALUES (?, ?, ?, ?, ?)').bind(proposal.tenant_id, proposal.id, 'accepted', JSON.stringify({ by: body.name, ip }), 'client').run();
-        // Notify owner (fire-and-forget)
-        (async () => {
+        // Notify owner (ctx.waitUntil to ensure delivery)
+        ctx.waitUntil((async () => {
           try {
             const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(proposal.tenant_id).first();
             if (tenant?.email) {
@@ -233,7 +233,7 @@ var startTime=Date.now();window.addEventListener('beforeunload',function(){var d
               });
             }
           } catch {}
-        })();
+        })());
         return json({ accepted: true });
       }
 
