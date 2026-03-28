@@ -1,4 +1,4 @@
-// Echo Proposals v1.0.0 — AI-powered proposal & quote builder
+// Echo Proposals v2.0.0 — AI-powered proposal & quote builder with Stripe payments
 // Cloudflare Worker: D1 + KV + Service Bindings (Engine Runtime, Shared Brain, Email Sender)
 
 interface Env {
@@ -10,6 +10,10 @@ interface Env {
   ECHO_API_KEY: string;
   ENVIRONMENT: string;
   AE: AnalyticsEngineDataset;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  PROPOSAL_HMAC_KEY?: string;
+  SITE_URL?: string;
 }
 
 interface RLState { c: number; t: number }
@@ -41,9 +45,32 @@ function json(data: unknown, status = 200): Response {
 function err(msg: string, status = 400): Response { return json({ error: msg }, status); }
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-proposals', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-proposals', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
+}
+
+async function generatePaymentToken(proposalId: string, tenantId: string, hmacKey: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(hmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${proposalId}:${tenantId}`));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function verifyStripeSignature(payload: string, header: string, secret: string): Promise<boolean> {
+  const parts = header.split(',').reduce((acc: Record<string, string>, p) => { const [k, v] = p.split('='); acc[k.trim()] = v; return acc; }, {});
+  const timestamp = parts['t']; const signature = parts['v1'];
+  if (!timestamp || !signature) return false;
+  const age = Math.floor(Date.now() / 1000) - parseInt(timestamp);
+  if (age > 300 || age < -60) return false;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${timestamp}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== signature.length) return false;
+  let result = 0;
+  for (let i = 0; i < expected.length; i++) result |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  return result === 0;
 }
 
 function authOk(req: Request, env: Env): boolean {
@@ -80,8 +107,8 @@ export default {
 
     try {
       // ── Public ──
-      if (p === '/') return json({ status: 'ok', service: 'echo-proposals', version: '1.0.0', timestamp: new Date().toISOString() });
-      if (p === '/health') return json({ status: 'ok', service: 'echo-proposals', version: '1.0.0', timestamp: new Date().toISOString() });
+      if (p === '/') return json({ status: 'ok', service: 'echo-proposals', version: '2.0.0', timestamp: new Date().toISOString(), features: ['stripe-checkout', 'payment-links', 'public-portal', 'e-signatures'] });
+      if (p === '/health') return json({ status: 'ok', service: 'echo-proposals', version: '2.0.0', timestamp: new Date().toISOString(), stripe: !!env.STRIPE_SECRET_KEY });
 
       // Public: view proposal
       if (p.startsWith('/p/') && m === 'GET') {
@@ -245,6 +272,135 @@ var startTime=Date.now();window.addEventListener('beforeunload',function(){var d
         return json({ ok: true });
       }
 
+      // ── Public portal (token-verified) ──
+      if (p.startsWith('/public/') && m === 'GET') {
+        const match = p.match(/^\/public\/proposal\/([^/]+)$/);
+        if (match) {
+          const propId = match[1];
+          const token = url.searchParams.get('token') || '';
+          const proposal = await env.DB.prepare(
+            `SELECT p.*, c.name as client_name, c.company as client_company, c.email as client_email,
+             t.name as tenant_name, t.logo_url, t.brand_color, t.email as tenant_email, t.phone as tenant_phone, t.website as tenant_website
+             FROM proposals p JOIN tenants t ON t.id = p.tenant_id LEFT JOIN clients c ON c.id = p.client_id WHERE p.id = ?`
+          ).bind(propId).first();
+          if (!proposal) return err('Proposal not found', 404);
+          if (!proposal.payment_token || proposal.payment_token !== token) {
+            if (url.searchParams.get('paid') !== 'true') return err('Invalid payment token', 403);
+          }
+          const isPaid = proposal.payment_status === 'paid';
+          const bc = proposal.brand_color || '#14b8a6';
+          // JSON response
+          const accept = req.headers.get('Accept') || '';
+          if (accept.includes('application/json')) {
+            return json({ proposal: { id: proposal.id, title: proposal.title, number: proposal.number, status: proposal.status, total: proposal.total, currency: proposal.currency, client_name: proposal.client_name, client_company: proposal.client_company, payment_status: proposal.payment_status || 'unpaid', payment_required: proposal.payment_required } });
+          }
+          // HTML portal
+          const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Proposal ${sanitize(String(proposal.number || ''), 50)}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;color:#1e293b}
+.top{background:${bc};color:#fff;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}.top h1{font-size:18px;font-weight:600}
+.badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;color:#fff;background:#0f172a}
+.card{background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin:24px auto;max-width:700px;padding:32px}
+.row{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #f1f5f9}.row:last-child{border:none}
+.label{color:#64748b;font-size:14px}.val{font-weight:600;font-size:14px}
+.total{font-size:28px;font-weight:700;color:#0f172a;text-align:center;padding:24px 0}
+.btn{display:block;width:100%;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;margin-top:16px}
+.btn-pay{background:#4f46e5;color:#fff}.btn-pay:hover{background:#4338ca}.btn-paid{background:#10b981;color:#fff;cursor:default}
+</style></head><body>
+<div class="top">${proposal.logo_url ? `<img src="${proposal.logo_url}" alt="" style="max-height:32px;margin-right:12px">` : ''}<h1>Proposal ${sanitize(String(proposal.number || ''), 50)}</h1><span class="badge">${proposal.status}</span></div>
+<div class="card">
+<h2 style="margin-bottom:16px">${sanitize(String(proposal.title || ''), 200)}</h2>
+<div class="row"><span class="label">Client</span><span class="val">${sanitize(String(proposal.client_name || 'N/A'), 100)}${proposal.client_company ? ` (${sanitize(String(proposal.client_company), 100)})` : ''}</span></div>
+<div class="row"><span class="label">From</span><span class="val">${sanitize(String(proposal.tenant_name || ''), 100)}</span></div>
+<div class="row"><span class="label">Date</span><span class="val">${proposal.created_at ? new Date(proposal.created_at as string).toLocaleDateString() : 'N/A'}</span></div>
+${proposal.valid_until ? `<div class="row"><span class="label">Valid Until</span><span class="val">${new Date(proposal.valid_until as string).toLocaleDateString()}</span></div>` : ''}
+${proposal.payment_terms ? `<div class="row"><span class="label">Payment Terms</span><span class="val">${sanitize(String(proposal.payment_terms), 200)}</span></div>` : ''}
+${proposal.total ? `<div class="total">${((proposal.currency as string) || 'USD').toUpperCase()} $${Number(proposal.total).toLocaleString('en-US', { minimumFractionDigits: 2 })}</div>` : ''}
+${isPaid ? '<a class="btn btn-paid">Payment Received</a>' : (proposal.total > 0 && proposal.payment_required) ? `<form method="POST" action="/public/proposal/${proposal.id}/pay?token=${token}"><button type="submit" class="btn btn-pay">Pay $${Number(proposal.total).toLocaleString('en-US', { minimumFractionDigits: 2 })} Now</button></form>` : ''}
+</div>
+<p style="text-align:center;color:#94a3b8;font-size:12px;padding:16px">Powered by Echo Proposals</p>
+</body></html>`;
+          return cors(new Response(html, { headers: { 'Content-Type': 'text/html;charset=utf-8' } }));
+        }
+      }
+
+      // Public: pay trigger (creates Stripe checkout, 303 redirect)
+      if (p.match(/^\/public\/proposal\/[^/]+\/pay$/) && m === 'POST') {
+        if (!env.STRIPE_SECRET_KEY) return err('Payments not configured', 503);
+        const propId = p.split('/')[3];
+        const token = url.searchParams.get('token') || '';
+        const proposal = await env.DB.prepare(
+          'SELECT p.*, c.email as client_email, c.name as client_name FROM proposals p LEFT JOIN clients c ON c.id = p.client_id WHERE p.id = ?'
+        ).bind(propId).first() as any;
+        if (!proposal) return err('Not found', 404);
+        if (!proposal.payment_token || proposal.payment_token !== token) return err('Invalid token', 403);
+        if (proposal.payment_status === 'paid') return err('Already paid', 400);
+        if (!proposal.total || proposal.total <= 0) return err('No amount', 400);
+        const amountCents = Math.round(Number(proposal.total) * 100);
+        const base = env.SITE_URL || url.origin;
+        const params = new URLSearchParams();
+        params.set('mode', 'payment');
+        params.set('payment_method_types[]', 'card');
+        params.set('line_items[0][price_data][currency]', (proposal.currency || 'usd').toLowerCase());
+        params.set('line_items[0][price_data][unit_amount]', String(amountCents));
+        params.set('line_items[0][price_data][product_data][name]', `Proposal: ${proposal.title}`);
+        params.set('line_items[0][price_data][product_data][description]', `${proposal.number}${proposal.client_name ? ' for ' + proposal.client_name : ''}`);
+        params.set('line_items[0][quantity]', '1');
+        params.set('success_url', `${base}/public/proposal/${propId}?paid=true`);
+        params.set('cancel_url', `${base}/public/proposal/${propId}?token=${token}`);
+        params.set('metadata[proposal_id]', propId);
+        params.set('metadata[tenant_id]', proposal.tenant_id);
+        params.set('metadata[proposal_number]', proposal.number || '');
+        if (proposal.client_email) params.set('customer_email', proposal.client_email);
+        try {
+          const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: params.toString(),
+          });
+          const session = await res.json() as any;
+          if (!res.ok) { slog('error', 'Stripe public checkout failed', { error: session }); return err('Payment service error', 502); }
+          await env.DB.prepare("UPDATE proposals SET stripe_checkout_id=? WHERE id=?").bind(session.id, propId).run();
+          slog('info', 'Public Stripe checkout created', { proposal_id: propId, session_id: session.id });
+          return new Response(null, { status: 303, headers: { Location: session.url } });
+        } catch (e: any) { slog('error', 'Stripe API error', { error: e.message }); return err('Payment unavailable', 502); }
+      }
+
+      // ── Stripe Webhook ──
+      if (p === '/webhooks/stripe' && m === 'POST') {
+        const body = await req.text();
+        const sigHeader = req.headers.get('Stripe-Signature') || '';
+        if (env.STRIPE_WEBHOOK_SECRET) {
+          if (!sigHeader) { slog('warn', 'Webhook missing signature'); return err('Missing signature', 401); }
+          const valid = await verifyStripeSignature(body, sigHeader, env.STRIPE_WEBHOOK_SECRET);
+          if (!valid) { slog('warn', 'Webhook invalid signature', { ip: req.headers.get('CF-Connecting-IP') || '' }); return err('Invalid signature', 401); }
+        }
+        let event: any;
+        try { event = JSON.parse(body); } catch { return err('Invalid JSON', 400); }
+        slog('info', 'Stripe webhook received', { type: event.type, id: event.id });
+        try {
+          if (event.type === 'checkout.session.completed') {
+            const session = event.data.object;
+            const proposalId = session.metadata?.proposal_id;
+            const tenantId = session.metadata?.tenant_id;
+            if (proposalId && session.payment_status === 'paid') {
+              await env.DB.batch([
+                env.DB.prepare("UPDATE proposals SET payment_status='paid', stripe_payment_intent=? WHERE id=?").bind(session.payment_intent || session.id, proposalId),
+                env.DB.prepare('INSERT INTO activity_log (tenant_id, proposal_id, action, details, actor) VALUES (?, ?, ?, ?, ?)').bind(tenantId || '', proposalId, 'payment_received', JSON.stringify({ amount: session.amount_total, currency: session.currency, session_id: session.id, payment_intent: session.payment_intent }), 'stripe'),
+              ]);
+              slog('info', 'Proposal payment recorded', { proposal_id: proposalId, amount: session.amount_total });
+            }
+          } else if (event.type === 'checkout.session.expired') {
+            const session = event.data.object;
+            const proposalId = session.metadata?.proposal_id;
+            if (proposalId) {
+              await env.DB.prepare("UPDATE proposals SET stripe_checkout_id=NULL WHERE id=? AND stripe_checkout_id=?").bind(proposalId, session.id).run();
+              slog('info', 'Checkout expired', { proposal_id: proposalId });
+            }
+          }
+        } catch (e: any) { slog('error', 'Webhook processing error', { error: e.message, type: event.type }); }
+        return json({ received: true });
+      }
+
       // ── Auth required ──
       if (!authOk(req, env)) return err('Unauthorized', 401);
       const tid = tenantId(req, url);
@@ -391,6 +547,61 @@ var startTime=Date.now();window.addEventListener('beforeunload',function(){var d
         return json({ sent: true, url: viewUrl });
       }
 
+      // ── Stripe: Generate payment link ──
+      if (p.match(/^\/proposals\/[^/]+\/payment-link$/) && m === 'POST') {
+        if (!env.PROPOSAL_HMAC_KEY) return err('Payment links not configured', 503);
+        const id = p.split('/')[2];
+        const proposal = await env.DB.prepare('SELECT * FROM proposals WHERE id=? AND tenant_id=?').bind(id, tid).first() as any;
+        if (!proposal) return err('Proposal not found', 404);
+        if (!proposal.total || proposal.total <= 0) return err('Proposal has no payment value', 400);
+        const token = await generatePaymentToken(proposal.id, proposal.tenant_id, env.PROPOSAL_HMAC_KEY);
+        await env.DB.prepare("UPDATE proposals SET payment_token=?, payment_required=1 WHERE id=?").bind(token, proposal.id).run();
+        const base = env.SITE_URL || url.origin;
+        const paymentUrl = `${base}/public/proposal/${proposal.id}?token=${token}`;
+        slog('info', 'Payment link generated', { proposal_id: proposal.id, value: proposal.total });
+        return json({ payment_url: paymentUrl, token, proposal_number: proposal.number, value: proposal.total, currency: proposal.currency });
+      }
+
+      // ── Stripe: Create checkout session ──
+      if (p.match(/^\/proposals\/[^/]+\/checkout$/) && m === 'POST') {
+        if (!env.STRIPE_SECRET_KEY) return err('Stripe not configured', 503);
+        const id = p.split('/')[2];
+        const proposal = await env.DB.prepare(
+          'SELECT p.*, c.email as client_email, c.name as client_name FROM proposals p LEFT JOIN clients c ON c.id=p.client_id WHERE p.id=? AND p.tenant_id=?'
+        ).bind(id, tid).first() as any;
+        if (!proposal) return err('Proposal not found', 404);
+        if (proposal.status === 'expired' || proposal.status === 'declined') return err(`Cannot pay ${proposal.status} proposal`, 400);
+        if (!proposal.total || proposal.total <= 0) return err('No payment amount', 400);
+        const amountCents = Math.round(Number(proposal.total) * 100);
+        const base = env.SITE_URL || url.origin;
+        const params = new URLSearchParams();
+        params.set('mode', 'payment');
+        params.set('payment_method_types[]', 'card');
+        params.set('line_items[0][price_data][currency]', (proposal.currency || 'usd').toLowerCase());
+        params.set('line_items[0][price_data][unit_amount]', String(amountCents));
+        params.set('line_items[0][price_data][product_data][name]', `Proposal: ${proposal.title}`);
+        params.set('line_items[0][price_data][product_data][description]', `${proposal.number}${proposal.client_name ? ' for ' + proposal.client_name : ''}`);
+        params.set('line_items[0][quantity]', '1');
+        params.set('success_url', `${base}/public/proposal/${proposal.id}?paid=true`);
+        params.set('cancel_url', `${base}/public/proposal/${proposal.id}?token=${proposal.payment_token || ''}`);
+        params.set('metadata[proposal_id]', proposal.id);
+        params.set('metadata[tenant_id]', proposal.tenant_id);
+        params.set('metadata[proposal_number]', proposal.number || '');
+        if (proposal.client_email) params.set('customer_email', proposal.client_email);
+        try {
+          const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: params.toString(),
+          });
+          const session = await res.json() as any;
+          if (!res.ok) { slog('error', 'Stripe checkout failed', { status: res.status, error: session }); return err(session.error?.message || 'Stripe error', 502); }
+          await env.DB.prepare("UPDATE proposals SET stripe_checkout_id=? WHERE id=?").bind(session.id, proposal.id).run();
+          slog('info', 'Stripe checkout created', { proposal_id: proposal.id, session_id: session.id, amount: amountCents });
+          return json({ checkout_url: session.url, session_id: session.id });
+        } catch (e: any) { slog('error', 'Stripe API error', { error: e.message }); return err('Stripe unavailable', 502); }
+      }
+
       // Clone proposal
       if (p.match(/^\/proposals\/[^/]+\/clone$/) && m === 'POST') {
         const id = p.split('/')[2];
@@ -517,6 +728,24 @@ Make prices realistic for the market. Include setup fees if appropriate.`;
         const limit = Math.min(parseInt(url.searchParams.get('limit')||'50'),200);
         const r = await env.DB.prepare('SELECT * FROM activity_log WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?').bind(tid, limit).all();
         return json({ activity: r.results });
+      }
+
+      // ── Stripe Migration ──
+      if (p === '/admin/migrate-stripe' && m === 'POST') {
+        const cols = [
+          { name: 'payment_token', sql: "ALTER TABLE proposals ADD COLUMN payment_token TEXT" },
+          { name: 'payment_required', sql: "ALTER TABLE proposals ADD COLUMN payment_required INTEGER DEFAULT 0" },
+          { name: 'payment_status', sql: "ALTER TABLE proposals ADD COLUMN payment_status TEXT DEFAULT 'unpaid'" },
+          { name: 'stripe_checkout_id', sql: "ALTER TABLE proposals ADD COLUMN stripe_checkout_id TEXT" },
+          { name: 'stripe_payment_intent', sql: "ALTER TABLE proposals ADD COLUMN stripe_payment_intent TEXT" },
+        ];
+        const results: string[] = [];
+        for (const col of cols) {
+          try { await env.DB.prepare(col.sql).run(); results.push(`${col.name}: added`); }
+          catch (e: any) { results.push(`${col.name}: ${e.message?.includes('duplicate') ? 'exists' : e.message}`); }
+        }
+        slog('info', 'Stripe migration completed', { results });
+        return json({ migrated: true, results });
       }
 
       try { env.AE.writeDataPoint({ blobs: [req.method, p, '404'], doubles: [Date.now()], indexes: ['echo-proposals'] }); } catch {}
