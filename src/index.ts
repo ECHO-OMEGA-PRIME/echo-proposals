@@ -80,6 +80,7 @@ export default {
 
     try {
       // ── Public ──
+      if (p === '/') return json({ service: 'echo-proposals', version: '1.0.0', status: 'operational' });
       if (p === '/health') return json({ status: 'ok', service: 'echo-proposals', version: '1.0.0', timestamp: new Date().toISOString() });
 
       // Public: view proposal
