@@ -34,7 +34,7 @@ function cors(res: Response): Response {
 }
 
 function json(data: unknown, status = 200): Response {
-  return cors(new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } }));
+  return cors(new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' , 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-XSS-Protection': '1; mode=block', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } }));
 }
 
 function err(msg: string, status = 400): Response { return json({ error: msg }, status); }
