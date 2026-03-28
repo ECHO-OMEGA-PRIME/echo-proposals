@@ -512,7 +512,11 @@ Make prices realistic for the market. Include setup fees if appropriate.`;
 
       return err('Not found', 404);
     } catch (e: any) {
-      return err(e.message || 'Internal error', 500);
+      if (e.message?.includes('JSON')) {
+        return err('Invalid JSON body', 400);
+      }
+      console.error(`[echo-proposals] ${e.message}`);
+      return err(e.message || 'Internal server error', 500);
     }
   },
 
