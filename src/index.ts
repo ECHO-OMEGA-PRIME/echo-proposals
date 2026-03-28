@@ -9,6 +9,7 @@ interface Env {
   EMAIL_SENDER: Fetcher;
   ECHO_API_KEY: string;
   ENVIRONMENT: string;
+  AE: AnalyticsEngineDataset;
 }
 
 interface RLState { c: number; t: number }
@@ -37,14 +38,13 @@ function json(data: unknown, status = 200): Response {
   return cors(new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' , 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-XSS-Protection': '1; mode=block', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } }));
 }
 
-function err(msg: string, status = 400): Response { return json({ error: msg }
+function err(msg: string, status = 400): Response { return json({ error: msg }, status); }
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
   const entry = { ts: new Date().toISOString(), level, worker: 'echo-proposals', version: '1.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
 }
-, status); }
 
 function authOk(req: Request, env: Env): boolean {
   return (req.headers.get('X-Echo-API-Key') || req.headers.get('Authorization')?.replace('Bearer ', '')) === env.ECHO_API_KEY;
@@ -76,6 +76,7 @@ export default {
     const url = new URL(req.url);
     const p = url.pathname;
     const m = req.method;
+    try { env.AE.writeDataPoint({ blobs: [m, p, '200'], doubles: [Date.now()], indexes: ['echo-proposals'] }); } catch {}
 
     try {
       // ── Public ──
@@ -517,12 +518,15 @@ Make prices realistic for the market. Include setup fees if appropriate.`;
         return json({ activity: r.results });
       }
 
+      try { env.AE.writeDataPoint({ blobs: [req.method, p, '404'], doubles: [Date.now()], indexes: ['echo-proposals'] }); } catch {}
       return err('Not found', 404);
     } catch (e: any) {
       if (e.message?.includes('JSON')) {
+        try { env.AE.writeDataPoint({ blobs: [req.method, new URL(req.url).pathname, '400'], doubles: [Date.now()], indexes: ['echo-proposals'] }); } catch {}
         return err('Invalid JSON body', 400);
       }
       slog('error', 'Unhandled request error', { error: e.message, stack: e.stack });
+      try { env.AE.writeDataPoint({ blobs: [req.method, new URL(req.url).pathname, '500'], doubles: [Date.now()], indexes: ['echo-proposals'] }); } catch {}
       return err(e.message || 'Internal server error', 500);
     }
   },
